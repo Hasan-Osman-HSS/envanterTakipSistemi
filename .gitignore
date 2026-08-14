@@ -1,5 +1,4 @@
 # Local WP Environment files
-/logs/
 /app/.envrc
 
 # System & Log Files
