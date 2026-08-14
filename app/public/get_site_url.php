@@ -1,0 +1,11 @@
+<?php
+$mysqli = new mysqli("127.0.0.1", "root", "root", "local", 10005);
+if ($mysqli->connect_error) {
+    die("Connect Error: " . $mysqli->connect_error);
+}
+$mysqli->set_charset("utf8mb4");
+
+$res = $mysqli->query("SELECT option_name, option_value FROM wp_options WHERE option_name IN ('siteurl', 'home')");
+while ($row = $res->fetch_assoc()) {
+    echo "{$row['option_name']}: {$row['option_value']}\n";
+}

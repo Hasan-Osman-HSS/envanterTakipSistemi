@@ -1,0 +1,1506 @@
+<?php
+/**
+ * Tier 2: Helper functions.
+ *
+ * This file defines all `automator_*` global helper functions. It loads after
+ * src/constants.php (tier 1) and before src/globals.php (tier 3).
+ *
+ * Rules for this file:
+ *   - Function definitions only. Do NOT execute anything at file scope, with
+ *     ONE exception: the `defined( 'ABSPATH' ) || exit;` early-exit guard at
+ *     the top of the file is fine — it doesn't call any WP function and
+ *     doesn't touch any Automator constant.
+ *   - Functions MAY reference AUTOMATOR_POST_TYPE_* and other tier 1 constants
+ *     inside their bodies (lazy — evaluated when called, not when defined).
+ *   - Functions MAY call WP functions inside their bodies, since by the time
+ *     they're invoked WordPress will be loaded.
+ *   - Do NOT add top-level constant lookups, apply_filters() calls, or any
+ *     other code outside function bodies. That would break the load chain
+ *     because globals.php (tier 3) hasn't loaded yet.
+ *
+ * Tier 1 → 2 → 3 load order is enforced in uncanny-automator.php.
+ *
+ * @package Uncanny_Automator
+ */
+
+defined( 'ABSPATH' ) || exit;
+//phpcs:disable Universal.Operators.DisallowStandalonePostIncrementDecrement.PostIncrementFound
+use Uncanny_Automator\Automator_Exception;
+use Uncanny_Automator\Automator_Options;
+use Uncanny_Automator\Automator_WP_Error;
+use Uncanny_Automator\DB_Tables;
+use Uncanny_Automator\Services\File\Extension_Support;
+use Uncanny_Automator\Set_Up_Automator;
+use Uncanny_Automator\Utilities;
+
+use function Uncanny_Automator\App\Infrastructure\automator_license_manager;
+
+// Add other Automator functions.
+require_once __DIR__ . DIRECTORY_SEPARATOR . 'core' . DIRECTORY_SEPARATOR . 'lib' . DIRECTORY_SEPARATOR . 'helper-functions' . DIRECTORY_SEPARATOR . 'automator-helper-functions.php';
+
+/**
+ * All recipe ecosystem post types that can trigger a manifest rebuild.
+ *
+ * Includes uo-loop because trashing/restoring a loop affects whether its
+ * children (actions, loop-filters) should be loaded. Any status change on
+ * any post type in the recipe tree should invalidate the manifest.
+ *
+ * Lives in the global namespace (not src/globals.php which declares
+ * `namespace Uncanny_Automator;`) so cross-namespace callers — notably Pro's
+ * Webhook_Index — can `function_exists()`-guard and call it without having to
+ * hardcode the `\Uncanny_Automator\` prefix. Previously namespaced, the silent
+ * fall-through caused webhook routes to never register on MCP recipe saves.
+ *
+ * @since 7.2.0
+ *
+ * @return string[]
+ */
+function automator_get_recipe_post_types() {
+
+	return apply_filters(
+		'automator_recipe_post_types',
+		array(
+			AUTOMATOR_POST_TYPE_RECIPE,
+			AUTOMATOR_POST_TYPE_TRIGGER,
+			AUTOMATOR_POST_TYPE_ACTION,
+			AUTOMATOR_POST_TYPE_CLOSURE,
+			AUTOMATOR_POST_TYPE_LOOP,
+			AUTOMATOR_POST_TYPE_LOOP_FILTER,
+			// AUTOMATOR_POST_TYPE_BLOCK,
+			// AUTOMATOR_POST_TYPE_FILTER_CONDITION,
+		)
+	);
+}
+
+/**
+ * Direct children of a recipe that carry a 'code' + 'integration' postmeta.
+ *
+ * @since 7.2.0
+ *
+ * @return string[]
+ */
+function automator_get_direct_recipe_child_types() {
+
+	return apply_filters(
+		'automator_direct_recipe_child_types',
+		array(
+			AUTOMATOR_POST_TYPE_TRIGGER,
+			AUTOMATOR_POST_TYPE_ACTION,
+			AUTOMATOR_POST_TYPE_CLOSURE,
+			// AUTOMATOR_POST_TYPE_BLOCK,
+		)
+	);
+}
+
+/**
+ * Post types that are children of a loop (uo-loop → child).
+ *
+ * @since 7.2.0
+ *
+ * @return string[]
+ */
+function automator_get_loop_child_types() {
+
+	return apply_filters(
+		'automator_loop_child_types',
+		array(
+			AUTOMATOR_POST_TYPE_ACTION,
+			AUTOMATOR_POST_TYPE_CLOSURE,
+			AUTOMATOR_POST_TYPE_LOOP_FILTER,
+			// AUTOMATOR_POST_TYPE_BLOCK,
+			// AUTOMATOR_POST_TYPE_FILTER_CONDITION,
+		)
+	);
+}
+
+/**
+ * All recognised integration sub-directory names.
+ *
+ * Used by Initialize_Automator, Set_Up_Automator, Legacy_Integrations,
+ * and Addon_Registry to determine which sub-folders to scan and merge.
+ *
+ * @since 7.2.0
+ *
+ * @return string[]
+ */
+function automator_get_default_directories() {
+
+	return apply_filters(
+		'automator_integration_default_directories',
+		array(
+			'actions',
+			'helpers',
+			'tokens',
+			'triggers',
+			'closures',
+			'conditions',
+			'loop-filters',
+		)
+	);
+}
+
+/**
+ * Gated recipe part directory names — the subset of default directories
+ * that are demand-loaded via the item map / manifest.
+ *
+ * Excludes 'helpers' and 'tokens' which are always loaded for active integrations.
+ *
+ * @since 7.2.0
+ *
+ * @return string[]
+ */
+function automator_get_gated_directory_types() {
+
+	return apply_filters(
+		'automator_gated_directory_types',
+		array(
+			'triggers',
+			'actions',
+			'closures',
+			'conditions',
+			'loop-filters',
+		)
+	);
+}
+
+/**
+ * Get recipe ID by it's child item
+ *
+ * @param $item_id
+ *
+ * @return int
+ */
+function automator_get_recipe_id( $item_id ) {
+	return Automator()->get->maybe_get_recipe_id( $item_id );
+}
+
+/**
+ * Add an integration
+ *
+ * @param $directory
+ *
+ * @return array|false
+ * @since 3.0
+ * @version 3.0
+ * @throws Automator_Exception
+ *
+ * @package Uncanny_Automator
+ */
+function automator_add_integration( $directory ) {
+	return Set_Up_Automator::read_directory( $directory );
+}
+
+/**
+ * Check if integration exists
+ *
+ * @param $integration
+ *
+ * @return bool
+ *
+ * @since 3.0
+ * @version 3.0
+ * @package Uncanny_Automator
+ */
+function automator_integration_exists( $integration ) {
+	$integration = strtolower( $integration );
+	if ( ! isset( Set_Up_Automator::$all_integrations[ $integration ] ) ) {
+		return false;
+	}
+
+	return true;
+}
+
+/**
+ * Get integration by name
+ *
+ * @param $name
+ *
+ * @return string
+ *
+ * @since 3.0
+ * @version 3.0
+ * @package Uncanny_Automator
+ */
+function automator_get_integration_by_name( $name ) {
+	$integration      = strtolower(
+		str_replace(
+			array( ' ', '_' ),
+			'-',
+			$name
+		)
+	);
+	$integration_keys = array_keys( Set_Up_Automator::$all_integrations );
+	if ( in_array( $integration, $integration_keys, true ) ) {
+		return $integration;
+	}
+	$return = '';
+	switch ( $integration ) {
+		case 'wordpress': //phpcs:ignore WordPress.WP.CapitalPDangit.Misspelled,WordPress.WP.CapitalPDangit.MisspelledInText
+			$return = 'wp';
+			break;
+		case 'easy-digital-downloads':
+			$return = 'edd';
+			break;
+		case 'automator':
+			$return = 'uncanny-automator';
+			break;
+	}
+
+	return apply_filters( 'automator_get_integration_key', $return, $integration, $name );
+}
+
+/**
+ * Add a trigger
+ *
+ * @param $path
+ * @param $integration
+ *
+ * @return bool
+ *
+ * @since 3.0
+ * @version 3.0
+ * @package Uncanny_Automator
+ */
+function automator_add_trigger( $path, $integration ) {
+	$integration = strtolower( $integration );
+	if ( ! automator_integration_exists( $integration ) ) {
+		return false;
+	}
+
+	Set_Up_Automator::$all_integrations[ $integration ]['triggers'][] = $path;
+
+	return true;
+}
+
+/**
+ * Add an action
+ *
+ * @param $path
+ * @param $integration
+ *
+ * @return bool
+ *
+ * @since 3.0
+ * @version 3.0
+ * @package Uncanny_Automator
+ */
+function automator_add_action( $path, $integration ) {
+	$integration = strtolower( $integration );
+	if ( ! automator_integration_exists( $integration ) ) {
+		return false;
+	}
+
+	Set_Up_Automator::$all_integrations[ $integration ]['actions'][] = $path;
+
+	return true;
+}
+
+/**
+ * Add integration directory — LEGACY PATH for third-party add-ons.
+ *
+ * This is Discovery Path 3 (see Initialize_Automator::load_framework_integrations() docblock).
+ * Call this from your plugin on or before plugins_loaded so the directory is in
+ * $auto_loaded_directories before Set_Up_Automator::initialize_add_integrations() runs on init.
+ *
+ * @param string $integration_code Unique integration code (e.g. 'MYINTEGRATION').
+ * @param string $directory        Absolute path to the integration directory.
+ * @param string $plugin_namespace Optional PHP namespace for the integration.
+ *
+ * @return bool
+ *
+ * @since 3.0
+ * @version 3.0
+ * @throws Automator_Exception
+ * @package Uncanny_Automator
+ */
+function automator_add_integration_directory( $integration_code, $directory, $plugin_namespace = '' ) {
+	$int_directory = automator_add_integration( $directory );
+	if ( ! isset( $int_directory['main'] ) ) {
+		return false;
+	}
+	Set_Up_Automator::$auto_loaded_directories[]                            = dirname( $int_directory['main'] );
+	Set_Up_Automator::$all_integrations[ $integration_code ]                = $int_directory;
+	Set_Up_Automator::$external_integrations_namespace[ $integration_code ] = $plugin_namespace;
+
+	return true;
+}
+
+/**
+ * Add an integration
+ *
+ * @param $icon_path
+ *
+ * @return string
+ */
+function automator_add_integration_icon( $icon_path, $plugin_path = AUTOMATOR_BASE_FILE ) {
+	return Utilities::automator_get_integration_icon( $icon_path, $plugin_path );
+}
+
+/**
+ * Get the $_POST/$_GET/$_REQUEST variable
+ *
+ * @param $type
+ * @param string $variable Defaults to null.
+ * @param $flags
+ *
+ * @return string
+ *
+ * @since 3.0
+ * @version 3.0
+ * @package Uncanny_Automator
+ */
+function automator_filter_input( $variable = null, $type = INPUT_GET, $flags = FILTER_UNSAFE_RAW ) {
+	/*
+	 * View input types: https://www.php.net/manual/en/function.filter-input.php
+	 * View flags at: https://www.php.net/manual/en/filter.filters.sanitize.php
+	 */
+	return sanitize_text_field( filter_input( $type, $variable, $flags ) );
+}
+
+if ( ! function_exists( 'automator_safe_unserialize' ) ) {
+	/**
+	 * Unserialize a value WITHOUT allowing object instantiation.
+	 *
+	 * Mirrors maybe_unserialize() semantics (non-serialized input is returned
+	 * as-is) but passes allowed_classes => false so an attacker-supplied
+	 * serialized object string can never instantiate a class -- closing the
+	 * PHP Object Injection vector on read/match paths that handle submitted
+	 * form values. Serialized arrays still decode to arrays.
+	 *
+	 * @param mixed $value Possibly-serialized value.
+	 *
+	 * @return mixed Decoded value with objects neutralised, or the original value.
+	 *
+	 * @since 7.3.1.4
+	 * @package Uncanny_Automator
+	 */
+	function automator_safe_unserialize( $value ) {
+		if ( ! is_string( $value ) ) {
+			return $value;
+		}
+		$trimmed = trim( $value );
+		if ( ! is_serialized( $trimmed ) ) {
+			return $value;
+		}
+		// phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.serialize_unserialize -- allowed_classes => false prevents object injection.
+		return unserialize( $trimmed, array( 'allowed_classes' => false ) );
+	}
+}
+
+
+/**
+ * Automator filter has var - check if the $_POST/$_GET/$_REQUEST has the variable
+ *
+ * @param $type
+ * @param null $variable
+ * @param $flags
+ *
+ * @return mixed
+ *
+ * @since 3.0
+ * @version 3.0
+ * @package Uncanny_Automator
+ */
+function automator_filter_has_var( $variable = null, $type = INPUT_GET ) {
+	return filter_has_var( $type, $variable );
+}
+
+/**
+ * Automator filter input array - get the $_POST/$_GET/$_REQUEST array variable
+ *
+ * @param $type
+ * @param null $variable
+ * @param $flags
+ *
+ * @return mixed
+ *
+ * @since 3.0
+ * @version 3.0
+ * @package Uncanny_Automator
+ */
+function automator_filter_input_array( $variable = null, $type = INPUT_GET, $flags = array() ) {
+	if ( empty( $flags ) ) {
+		$flags = array(
+			'filter' => FILTER_UNSAFE_RAW,
+			'flags'  => FILTER_REQUIRE_ARRAY,
+		);
+	}
+	/*
+	 * View input types: https://www.php.net/manual/en/function.filter-input.php
+	 * View flags at: https://www.php.net/manual/en/filter.filters.sanitize.php
+	 */
+	$args = array( $variable => $flags );
+	$val  = filter_input_array( $type, $args );
+
+	return isset( $val[ $variable ] ) ? $val[ $variable ] : array();
+}
+
+/**
+ * Get a sanitized value from $_REQUEST.
+ *
+ * Wraps the common isset → wp_unslash → urldecode → sanitize_text_field pattern.
+ *
+ * @param string $variable The $_REQUEST key (e.g. 'page', 'action', 'tab').
+ *
+ * @return string Sanitized value or empty string if not set.
+ *
+ * @since 7.2
+ */
+function automator_request_input( $variable ) {
+	// phpcs:ignore WordPress.Security.NonceVerification.Recommended
+	return isset( $_REQUEST[ $variable ] ) ? sanitize_text_field( wp_unslash( urldecode( $_REQUEST[ $variable ] ) ) ) : '';
+}
+
+/**
+ * Automator exception
+ *
+ * @param mixed $message
+ * @param $code
+ *
+ * @since 3.0
+ * @version 3.0
+ * @throws Automator_Exception
+ *
+ * @package Uncanny_Automator
+ */
+function automator_exception( $message, $code = 999 ) {
+	throw new Automator_Exception( esc_html( $message ), esc_html( $code ) );
+}
+
+/**
+ * Add Error
+ *
+ * @param $message
+ * @param mixed $error_code
+ * @param mixed $data
+ *
+ * @since 3.0
+ * @version 3.0
+ * @package Uncanny_Automator
+ */
+function automator_wp_error( $message, $error_code = 'something_wrong', $data = '' ) {
+	Automator()->wp_error->add_error( $error_code, $message, $data );
+}
+
+
+/**
+ * Show error messages
+ *
+ * @param $error_code
+ *
+ * @since 3.0
+ * @version 3.0
+ * @package Uncanny_Automator
+ */
+function automator_wp_error_messages( $error_code = '' ) {
+	Automator()->wp_error->get_messages( $error_code );
+}
+
+/**
+ * Show error message
+ *
+ * @param string|mixed $error_code
+ *
+ * @since 3.0
+ * @version 3.0
+ * @package Uncanny_Automator
+ */
+function automator_wp_error_get_message( $error_code = 'something_wrong' ) {
+	Automator()->wp_error->get_message( $error_code );
+}
+
+/**
+ * Check if thing is an error
+ *
+ * @param mixed $thing
+ *
+ * @return bool
+ *
+ * @since 3.0
+ * @version 3.0
+ * @package Uncanny_Automator
+ */
+function is_automator_error( $thing ) {
+	return $thing instanceof Automator_WP_Error;
+}
+
+/**
+ * Check if VIEWS exits
+ *
+ * @param $type
+ *
+ * @return bool
+ */
+function automator_db_view_exists( $type = 'recipe' ) {
+	return \Uncanny_Automator\Automator_DB::is_view_exists( $type );
+}
+
+/**
+ * Global function to create and log custom messages.
+ *
+ * @param mixed $message
+ * @param mixed $subject
+ * @param bool $force_log
+ * @param mixed $log_file
+ * @param false $backtrace
+ *
+ * @since 3.0
+ * @version 3.0
+ * @package Uncanny_Automator
+ */
+function automator_log( $message = '', $subject = '', $force_log = false, $log_file = 'debug', $backtrace = false ) {
+	Utilities::log( $message, $subject, $force_log, $log_file, $backtrace );
+}
+
+/**
+ * Purge recipe logs
+ *
+ * @param $recipe_id
+ * @param $automator_recipe_log_id
+ */
+function automator_purge_recipe_logs( $recipe_id, $automator_recipe_log_id ) {
+	Automator()->db->recipe->delete_logs( $recipe_id, $automator_recipe_log_id );
+}
+
+/**
+ * Purge trigger logs
+ *
+ * @param $recipe_id
+ * @param $automator_recipe_log_id
+ */
+function automator_purge_trigger_logs( $recipe_id, $automator_recipe_log_id ) {
+	Automator()->db->trigger->delete_logs( $recipe_id, $automator_recipe_log_id );
+}
+
+/**
+ * Purge action logs
+ *
+ * @param $recipe_id
+ * @param $automator_recipe_log_id
+ */
+function automator_purge_action_logs( $recipe_id, $automator_recipe_log_id ) {
+	Automator()->db->action->delete_logs( $recipe_id, $automator_recipe_log_id );
+}
+
+/**
+ * Purge api logs
+ *
+ * @param $recipe_id
+ * @param $automator_recipe_log_id
+ */
+function automator_purge_api_logs( $recipe_id, $automator_recipe_log_id ) {
+	Automator()->db->api->delete_logs( $recipe_id, $automator_recipe_log_id );
+}
+
+/**
+ * Purge closure logs
+ *
+ * @param $recipe_id
+ * @param $automator_recipe_log_id
+ */
+function automator_purge_closure_logs( $recipe_id, $automator_recipe_log_id ) {
+	Automator()->db->closure->delete_logs( $recipe_id, $automator_recipe_log_id );
+}
+
+/**
+ * Add UTM parameters to a given URL
+ *
+ * @param String $url URL
+ * @param array $medium The value for utm_medium
+ * @param array $content The value for utm_content
+ *
+ * @return String           URL with the UTM parameters
+ */
+function automator_utm_parameters( $url, $medium = '', $content = '' ) {
+	// UTM Convention (in-plugin links): all lowercase, hyphenated.
+	//   utm_source   = uncanny-automator (fixed below)
+	//   utm_medium   = in-plugin (fixed below)
+	//   utm_content  = $medium arg  — the UI location (e.g. settings, license-page)
+	//   utm_campaign = $content arg — the feature/element (e.g. upgrade-to-pro, help-button)
+
+	$default_utm_parameters = array(
+		'source' => 'uncanny-automator',
+	);
+
+	try {
+		// Parse the URL
+		$url_parts = wp_parse_url( $url );
+
+		// If URL doesn't have a query string.
+		if ( isset( $url_parts['query'] ) ) {
+			// Avoid 'Undefined index: query'
+			parse_str( $url_parts['query'], $params );
+		} else {
+			$params = array();
+		}
+
+		// Add default parameters
+		foreach ( $default_utm_parameters as $default_utm_parameter_key => $default_utm_parameter_value ) {
+			$params[ 'utm_' . $default_utm_parameter_key ] = $default_utm_parameter_value;
+		}
+
+		// In-plugin links use a fixed medium; location -> utm_content, feature -> utm_campaign.
+		$params['utm_medium'] = 'in-plugin';
+
+		if ( ! empty( $medium ) ) {
+			$params['utm_content'] = strtolower( str_replace( '_', '-', $medium ) );
+		}
+
+		if ( ! empty( $content ) ) {
+			$params['utm_campaign'] = strtolower( str_replace( '_', '-', $content ) );
+		}
+
+		// Encode parameters
+		$url_parts['query'] = http_build_query( $params );
+
+		if ( function_exists( 'http_build_url' ) ) {
+			// If the user has pecl_http
+			$url = http_build_url( $url_parts );
+		} else {
+			$url_parts['path'] = ! empty( $url_parts['path'] ) ? $url_parts['path'] : '';
+
+			$url = $url_parts['scheme'] . '://' . $url_parts['host'] . $url_parts['path'] . '?' . $url_parts['query'];
+		}
+	} catch ( \Exception $e ) { //phpcs:ignore Generic.CodeAnalysis.EmptyStatement.DetectedCatch
+	}
+
+	return $url;
+}
+
+/**
+ * Check if automator pro is active or not.
+ *
+ * @return boolean True if automator pro is active. Otherwise false.
+ */
+function is_automator_pro_active() {
+
+	// Check if automator pro is in list of active plugins.
+	return defined( 'AUTOMATOR_PRO_PLUGIN_VERSION' );
+}
+
+/**
+ * Check if the current admin request is an Automator page.
+ *
+ * Matches: settings, dashboard, logs, recipe list/editor, and form POSTs
+ * from Automator settings (e.g. Connect/Disconnect buttons via admin-post.php).
+ *
+ * @since 7.2
+ *
+ * @return bool
+ */
+function is_automator_admin_page() {
+
+	// Nonce verification is intentionally skipped throughout this function.
+	// This is a routing decision during plugin bootstrap (plugins_loaded), not a
+	// data mutation. It runs before nonce infrastructure is fully available and
+	// only determines whether to load all integrations vs demand-driven mode.
+
+	// Page parameter (GET or POST): uncanny-automator-config, uncanny-automator-dashboard, etc.
+	$page = automator_request_input( 'page' );
+
+	if ( '' !== $page && 0 === strpos( $page, 'uncanny-automator' ) ) {
+		return true;
+	}
+
+	// Recipe list or editor: post_type=uo-recipe.
+	$post_type = automator_request_input( 'post_type' );
+
+	if ( AUTOMATOR_POST_TYPE_RECIPE === $post_type ) {
+		return true;
+	}
+
+	// Form submissions from Automator settings (Connect/Disconnect buttons).
+	if ( '' !== automator_request_input( 'automator_action' ) ) {
+		return true;
+	}
+
+	// Admin-post.php with Automator-prefixed action.
+	$action = automator_request_input( 'action' );
+
+	if ( '' !== $action && ( 0 === strpos( $action, 'automator' ) || 0 === strpos( $action, 'uap_' ) ) ) {
+		return true;
+	}
+
+	return false;
+}
+
+/**
+ * Check if the current request URI or REST route contains a given path segment.
+ *
+ * Checks $_SERVER['REQUEST_URI'] first (covers pretty permalinks and most plain
+ * permalink setups), then falls back to $_GET['rest_route'] for servers where
+ * REQUEST_URI does not include the query string (e.g. some Nginx/FastCGI configs).
+ *
+ * @since 7.2
+ *
+ * @param string $segment The path segment to search for (e.g. 'uap/v2').
+ *
+ * @return bool
+ */
+function automator_request_contains( $segment ) {
+
+	$request_uri = isset( $_SERVER['REQUEST_URI'] ) ? sanitize_text_field( wp_unslash( urldecode( $_SERVER['REQUEST_URI'] ) ) ) : ''; // phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotValidated
+
+	if ( '' !== $request_uri && false !== strpos( $request_uri, $segment ) ) {
+		return true;
+	}
+
+	// Plain permalink fallback — REQUEST_URI may omit the query string on some servers.
+	// phpcs:ignore WordPress.Security.NonceVerification.Recommended
+	$rest_route = isset( $_GET['rest_route'] ) ? sanitize_text_field( wp_unslash( urldecode( $_GET['rest_route'] ) ) ) : '';
+
+	return '' !== $rest_route && false !== strpos( $rest_route, $segment );
+}
+
+/**
+ * Check if the current request is an Automator REST API request.
+ *
+ * Detects requests to /wp-json/uap/v2/ endpoints (e.g. integration-settings,
+ * webhooks). REST_REQUEST constant is NOT available during plugin loading
+ * (defined at parse_request), so we detect from the URI directly.
+ *
+ * @since 7.2
+ *
+ * @return bool
+ */
+function is_automator_rest_request() {
+	return automator_request_contains( AUTOMATOR_REST_API_END_POINT );
+}
+
+/**
+ * Check if the current request is an MCP REST API request.
+ *
+ * @return bool
+ */
+function is_mcp_rest_request() {
+	return automator_request_contains( 'automator/v1/mcp' );
+}
+
+/**
+ * Check if pro license is valid
+ *
+ * @return bool
+ */
+function is_automator_pro_license_valid() {
+	if ( 'pro' === automator_license_manager()->get_type() ) {
+		return true;
+	}
+
+	return false;
+}
+
+
+/**
+ * automator_pro_older_than
+ *
+ * Returns true if Automator Pro is enabled and older than the $version
+ *
+ * @param mixed $version
+ *
+ * @return bool
+ */
+function automator_pro_older_than( $version ) {
+
+	if ( defined( 'AUTOMATOR_PRO_PLUGIN_VERSION' ) ) {
+		return version_compare( AUTOMATOR_PRO_PLUGIN_VERSION, $version, '<' );
+	}
+
+	return false;
+}
+
+/**
+ * Clear all recipe activity
+ *
+ * @param $recipe_id
+ *
+ * @return void
+ */
+function clear_recipe_logs( $recipe_id ) {
+
+	/**
+	 * Fires before all logs for a recipe are cleared.
+	 *
+	 * This hook allows extensions (like Pro) to perform cleanup before the log data
+	 * is removed, such as cancelling scheduled actions in Action Scheduler.
+	 *
+	 * @since 6.9
+	 *
+	 * @param int $recipe_id The recipe ID whose logs are being cleared.
+	 */
+	do_action( 'automator_before_recipe_logs_cleared', $recipe_id );
+
+	Automator()->db->recipe->clear_activity_log_by_recipe_id( $recipe_id );
+}
+
+
+/**
+ * Only identify and add tokens IF it's edit recipe page
+ * @return bool
+ */
+function automator_do_identify_tokens() {
+
+	// Allow override via constant
+	if ( defined( 'AUTOMATOR_FORCE_EDIT_PAGE' ) && AUTOMATOR_FORCE_EDIT_PAGE ) {
+		return true;
+	}
+	// If it's cron, do not identify tokens
+	if ( defined( 'DOING_CRON' ) ) {
+		return false;
+	}
+
+	if (
+		isset( $_REQUEST['action'] ) && //phpcs:ignore WordPress.Security.NonceVerification.Recommended
+		(
+			'heartbeat' === (string) sanitize_text_field( wp_unslash( urldecode( $_REQUEST['action'] ) ) ) || //phpcs:ignore WordPress.Security.NonceVerification.Recommended
+			'wp-remove-post-lock' === (string) sanitize_text_field( wp_unslash( urldecode( $_REQUEST['action'] ) ) )  //phpcs:ignore WordPress.Security.NonceVerification.Recommended
+		)
+	) { //phpcs:ignore WordPress.Security.NonceVerification.Recommended
+		// if it's heartbeat, post lock actions bail
+		return false;
+	}
+
+	if ( ! Automator()->helpers->recipe->is_edit_page() && ! Automator()->helpers->recipe->is_valid_token_endpoint() ) {
+		// If not automator edit page or rest call, bail
+		return false;
+	}
+
+	return true;
+}
+
+/**
+ * Duplicate a trigger or an action
+ *
+ * @param $part_id
+ * @param $recipe_id
+ * @param $status
+ *
+ * @return false|int|WP_Error
+ */
+function automator_duplicate_recipe_part( $part_id, $recipe_id, $status = 'draft' ) {
+	if ( ! class_exists( '\Uncanny_Automator\Automator_Load' ) ) {
+		return false;
+	}
+	/** @var \Uncanny_Automator\Copy_Recipe_Parts $copy_recipe_part */
+	$copy_recipe_part = \Uncanny_Automator\Automator_Load::$core_class_inits['Copy_Recipe_Parts'];
+	if ( ! $copy_recipe_part instanceof \Uncanny_Automator\Copy_Recipe_Parts ) {
+		return false;
+	}
+
+	return $copy_recipe_part->copy( $part_id, $recipe_id, $status );
+}
+
+/**
+ * Method automator_sort_options
+ *
+ * @param array $a
+ * @param array $b
+ *
+ * @return int
+ */
+function automator_sort_options( $a, $b ) {
+	return strcmp( $a['text'], $b['text'] );
+}
+
+/**
+ * automator_array_as_options
+ *
+ * @param array $array
+ *
+ * @return array
+ */
+function automator_array_as_options( $array_as_options ) {
+
+	$options = array();
+
+	foreach ( $array_as_options as $value => $text ) {
+		$options[] = array(
+			'value' => $value,
+			'text'  => $text,
+		);
+	}
+
+	return $options;
+}
+
+// String oprtations fallback for old PHP versions.
+
+if ( ! function_exists( 'str_starts_with' ) ) {
+	/**
+	 * @param $haystack
+	 * @param $needle
+	 *
+	 * @return bool
+	 */
+	function str_starts_with( $haystack, $needle ) {
+		return '' !== (string) $needle && strncmp( $haystack, $needle, strlen( $needle ) ) === 0;
+	}
+}
+
+if ( ! function_exists( 'str_ends_with' ) ) {
+	/**
+	 * @param $haystack
+	 * @param $needle
+	 *
+	 * @return bool
+	 */
+	function str_ends_with( $haystack, $needle ) {
+		return '' !== $needle && substr( $haystack, - strlen( $needle ) ) === (string) $needle;
+	}
+}
+
+if ( ! function_exists( 'str_contains' ) ) {
+	/**
+	 * @param $haystack
+	 * @param $needle
+	 *
+	 * @return bool
+	 */
+	function str_contains( $haystack, $needle ) {
+		return '' !== $needle && mb_strpos( $haystack, $needle ) !== false;
+	}
+}
+
+/**
+ * Get the Automator_Options instance.
+ *
+ * Retrieves the existing instance of the Automator_Options class.
+ *
+ * @return Automator_Options
+ */
+function automator_options() {
+
+	static $instance = null;
+
+	if ( null === $instance ) {
+		$instance = new Automator_Options();
+	}
+
+	return $instance;
+}
+
+/**
+ * automator_get_option
+ *
+ * @param string $key
+ * @param mixed $default_value
+ *
+ * @return mixed
+ */
+function automator_get_option( $key, $default_value = false, $force = false ) {
+	return automator_options()->get_option( $key, $default_value, $force );
+}
+
+/**
+ * Adds or updates an option in the uap_options table.
+ *
+ * @param string $key Name of the option.
+ * @param mixed  $value Value of the option.
+ * @param bool   $autoload Whether to autoload the option or not.
+ * @param bool   $run_actions Whether to run do_action hooks or not.
+ *
+ * @return void
+ */
+function automator_add_option( $key, $value, $autoload = true, $run_actions = true ) {
+	return automator_options()->add_option( $key, $value, $autoload, $run_actions );
+}
+
+/**
+ * @param $key
+ *
+ * @return bool
+ */
+function automator_delete_option( $key ) {
+	return automator_options()->delete_option( $key );
+}
+
+/**
+ * Updates or adds an option in the uap_options table using upsert.
+ *
+ * @param string $option Name of the option.
+ * @param mixed $value Value of the option.
+ * @param bool $autoload Whether to autoload the option or not.
+ *
+ * @return bool True if the operation was successful, false otherwise.
+ */
+function automator_update_option( $option, $value, $autoload = true ) {
+	return automator_options()->update_option( $option, $value, $autoload );
+}
+
+/**
+ * Wrapper function for add_settings_error.
+ *
+ * Bails if add_settings_error function is not yet loaded. Prevents fatal error when adding an option too early.
+ *
+ * @param string $setting Slug title of the setting to which this error applies.
+ * @param string $code Slug-name to identify the error. Used as part of 'id' attribute in HTML output.
+ * @param string $message The formatted message text to display to the user (will be shown inside styled <div> and <p> tags).
+ * @param string $type Message type, controls HTML class. Possible values include 'error', 'success', 'warning', 'info'. Default 'error'.
+ *
+ */
+function automator_add_settings_error( $setting = '', $code = '', $message = '', $type = 'error' ) {
+
+	if ( ! function_exists( 'add_settings_error' ) ) {
+		return;
+	}
+
+	add_settings_error( $setting, $code, $message, $type );
+}
+
+/**
+ * Store a flash message.
+ *
+ * @param string $key    Unique key for the message (e.g. integration slug).
+ * @param string $message The message to show.
+ * @param string $type    Type of message: 'error', 'success', 'warning', 'info'.
+ * @param int    $ttl     Optional. Time-to-live in seconds. Default: 30.
+ */
+function automator_flash_message( string $key, string $message, string $type = 'error', int $ttl = 30 ): void {
+
+	set_transient(
+		"automator_flash_{$key}",
+		array(
+			'message' => $message,
+			'type'    => $type,
+		),
+		$ttl
+	);
+}
+
+/**
+ * Display and auto-clear a flash message if it exists.
+ *
+ * @param string $key Unique key used when storing the message.
+ *
+ * @return array|false False if no message is found. Otherwise, an array with the message type and message.
+ */
+function automator_get_flash_message( string $key ) {
+
+	$transient = get_transient( "automator_flash_{$key}" );
+
+	if ( ! $transient ) {
+		return false;
+	}
+
+	delete_transient( "automator_flash_{$key}" );
+
+	$type    = esc_attr( $transient['type'] ?? 'info' );
+	$message = wp_kses_post( $transient['message'] ?? '' );
+
+	return array(
+		'type'    => $type,
+		'message' => $message,
+	);
+}
+
+/**
+ * Deletes all cache that are member of a specific cache group.
+ *
+ * @param string $group
+ *
+ * @return void
+ */
+function automator_cache_delete_group( $group = 'automator' ) {
+
+	$purge_group = true;
+
+	// LiteSpeed Cache
+	if ( class_exists( '\LiteSpeed\Purge' ) && method_exists( '\LiteSpeed\Purge', 'purge_all' ) ) {
+		// Purge all LS Cache & Object cache
+		\LiteSpeed\Purge::purge_all( 'Called by Automator' );
+		$purge_group = false; // Since all cache is already cleared
+	}
+
+	// W3 Total Cache
+	if ( function_exists( 'w3tc_flush_all' ) ) {
+		w3tc_flush_all();
+		$purge_group = false; // Since all cache is already cleared
+	}
+
+	// WP Super Cache
+	if ( function_exists( 'wp_cache_clear_cache' ) ) {
+		wp_cache_clear_cache();
+		$purge_group = false; // Since all cache is already cleared
+	}
+
+	// WP Rocket
+	if ( function_exists( 'rocket_clean_domain' ) ) {
+		rocket_clean_domain();
+		$purge_group = false; // Since all cache is already cleared
+	}
+
+	// Nginx Cache (if applicable)
+	if ( function_exists( 'nginx_cache_purge' ) ) {
+		nginx_cache_purge();
+		$purge_group = false; // Since all cache is already cleared
+	}
+
+	// Redis Cache
+	if ( class_exists( 'RedisObjectCache' ) && method_exists( 'RedisObjectCache', 'flush' ) ) {
+		RedisObjectCache::flush();
+		$purge_group = false; // Since all cache is already cleared
+	}
+
+	if ( function_exists( 'wp_cache_flush_group' ) && $purge_group ) {
+		wp_cache_flush_group( $group );
+	}
+
+	/** @type WP_Object_Cache $wp_object_cache */
+	global $wp_object_cache;
+
+	$cache = $wp_object_cache->cache ?? array();
+
+	if ( isset( $cache[ $group ] ) ) {
+		unset( $cache[ $group ] );
+		$wp_object_cache->cache = $cache;
+	}
+
+	// Clear Cloudflare Cache
+	clear_cloudflare_cache();
+
+	// Clear Fastly Cache
+	clear_fastly_cache();
+}
+
+/**
+ * @return bool
+ */
+function clear_cloudflare_cache() {
+
+	// Check if the Cloudflare plugin is active and the purge_cache method exists
+	if ( defined( 'CLOUDFLARE_PLUGIN_DIR' ) && class_exists( 'CF\WordPress\Hooks' ) ) {
+		( new \CF\WordPress\Hooks() )->purgeCacheEverything();
+
+		return true;
+	}
+
+	$email   = AUTOMATOR_CLOUDFLARE_EMAIL;
+	$api_key = AUTOMATOR_CLOUDFLARE_API_KEY;
+	$zone_id = AUTOMATOR_CLOUDFLARE_ZONE_ID;
+
+	if ( empty( $email ) || empty( $api_key ) || empty( $zone_id ) ) {
+		return false;
+	}
+
+	$url = 'https://api.cloudflare.com/client/v4/zones/' . $zone_id . '/purge_cache';
+
+	$body = wp_json_encode( array( 'purge_everything' => true ) );
+
+	$response = wp_remote_post(
+		$url,
+		array(
+			'method'  => 'POST',
+			'headers' => array(
+				'Content-Type' => 'application/json',
+				'X-Auth-Email' => $email,
+				'X-Auth-Key'   => $api_key,
+			),
+			'body'    => $body,
+		)
+	);
+
+	if ( is_wp_error( $response ) ) {
+		return false;
+	}
+
+	return true;
+}
+
+/**
+ * @return bool
+ */
+function clear_fastly_cache() {
+	$api_key    = AUTOMATOR_FASTLY_API_KEY;
+	$service_id = AUTOMATOR_FASTLY_SERVICE_ID;
+
+	if ( empty( $api_key ) || empty( $service_id ) ) {
+		return false;
+	}
+
+	$url = 'https://api.fastly.com/service/' . $service_id . '/purge_all';
+
+	$response = wp_remote_post(
+		$url,
+		array(
+			'method'  => 'POST',
+			'headers' => array(
+				'Fastly-Key' => $api_key,
+				'Accept'     => 'application/json',
+			),
+		)
+	);
+
+	if ( is_wp_error( $response ) ) {
+		return false;
+	}
+
+	return true;
+}
+
+/**
+ * Get allowed file attachments for email.
+ *
+ * @return string[]
+ */
+function automator_get_allowed_attachment_ext() {
+
+	return apply_filters( 'automator_get_allowed_attachment_ext', Extension_Support::$common_file_extensions );
+}
+
+/**
+ * Checks whether a URL resolves to a private or reserved IP address.
+ *
+ * Blocks RFC1918 private ranges, loopback, link-local (e.g. 169.254.169.254),
+ * and reserved ranges to prevent SSRF attacks.
+ *
+ * Known limitation — DNS rebinding / TOCTOU race:
+ * The hostname is resolved once here via gethostbyname(). The actual HTTP
+ * request happens later and uses the OS resolver again, so a low-TTL DNS
+ * record could change between check and request (DNS rebinding). This is a
+ * fundamental limitation of PHP-level SSRF protection without a custom DNS
+ * resolver. Mitigations already in place that reduce the practical window:
+ *  - 'redirection' => 0 on every outbound request prevents redirect-chain bypass.
+ *  - The REST endpoint requires manage_options (Administrator), narrowing who
+ *    can trigger the race.
+ * Full protection would require resolving the IP once and connecting by IP,
+ * which is not supported by the WordPress HTTP API.
+ *
+ * @param string $url
+ *
+ * @return bool True if private/reserved (block it), false if safe to request.
+ */
+function automator_resolves_to_private_ip( $url ) {
+
+	$host = wp_parse_url( $url, PHP_URL_HOST );
+
+	if ( empty( $host ) ) {
+		return true;
+	}
+
+	// Strip brackets from IPv6 literals e.g. [::1].
+	$host = trim( $host, '[]' );
+
+	if ( filter_var( $host, FILTER_VALIDATE_IP ) ) {
+		// Host is already a bare IP address — validate it directly.
+		$ip = $host;
+	} else {
+		$ip = gethostbyname( $host );
+		// gethostbyname() returns the original string when resolution fails.
+		if ( $ip === $host ) {
+			return true;
+		}
+	}
+
+	// Block private (RFC1918) and reserved ranges (loopback, link-local, etc.).
+	return false === filter_var( $ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE );
+}
+
+/**
+ * @param $input
+ *
+ * @return array
+ */
+function automator_array_filter_recursive( $input ) {
+	foreach ( $input as &$value ) {
+		if ( is_array( $value ) ) {
+			$value = automator_array_filter_recursive( $value );
+		}
+	}
+
+	return array_filter(
+		$input,
+		function ( $value ) {
+			return ! ( is_string( $value ) && empty( trim( $value ) ) );
+		}
+	);
+}
+
+/**
+ * array_merge with recursion to merge sub-array keys and values
+ *
+ * @param array $array1
+ * @param array $array2
+ *
+ * @return array
+ * @since 5.10
+ */
+function automator_array_merge( array &$array1, array &$array2 ) {
+	$merged = $array1;
+
+	foreach ( $array2 as $key => &$value ) {
+		if ( is_array( $value ) && isset( $merged[ $key ] ) && is_array( $merged[ $key ] ) ) {
+			$merged[ $key ] = automator_array_merge( $merged[ $key ], $value );
+		} else {
+			$merged[ $key ] = $value;
+		}
+	}
+
+	return $merged;
+}
+
+
+if ( ! function_exists( 'is_iterable' ) ) {
+	/**
+	 * Add is_iterable function for PHP < 7.1
+	 *
+	 * @param $var
+	 *
+	 * @return bool
+	 */
+	function is_iterable( $iterable_var ) {
+		return is_array( $iterable_var ) || $iterable_var instanceof Traversable;
+	}
+}
+
+/**
+ * Detects if we're running Automator's unit tests
+ * This function uses multiple specific checks to ensure we're only detecting
+ * Automator's own test environment and not conflicting with other plugins
+ *
+ * @return bool
+ */
+function is_automator_running_unit_tests() {
+
+	// Primary check - explicit environment variable (set in CI and local)
+	if ( isset( $_ENV['DOING_AUTOMATOR_TEST'] ) || defined( 'DOING_AUTOMATOR_TEST' ) ) {
+		return true;
+	}
+
+	// Only proceed if we can confirm we're in Automator's directory context
+	if ( ! defined( 'UA_ABSPATH' ) ) {
+		return false;
+	}
+
+	// Secondary check - Multiple Automator-specific indicators must be present
+	$automator_indicators = 0;
+
+	// Check 1: Automator-specific test class exists
+	if ( class_exists( '\\AutomatorTestCase' ) ) {
+		$automator_indicators++;
+	}
+
+	// Check 2: WpunitTester exists (less specific, but adds confidence)
+	if ( class_exists( '\\WpunitTester' ) ) {
+		$automator_indicators++;
+	}
+
+	// Check 3: Automator's specific test configuration exists
+	$test_config = UA_ABSPATH . '/tests/wpunit.suite.yml';
+	if ( file_exists( $test_config ) ) {
+		$automator_indicators++;
+
+		// Additional validation - ensure config is specifically for Automator
+		$config_content = file_get_contents( $test_config ); //phpcs:ignore WordPress.WP.AlternativeFunctions.file_get_contents_file_get_contents
+		if ( false !== strpos( $config_content, 'uncanny-automator/uncanny-automator.php' ) ) {
+			$automator_indicators++;
+		}
+	}
+
+	// Check 4: We're running from within Automator's directory structure
+	$current_file = __FILE__;
+	if ( false !== strpos( $current_file, 'uncanny-automator' ) ) {
+		$automator_indicators++;
+	}
+
+	// Check 5: PHPUnit with Automator's composer.json
+	if ( defined( 'PHPUNIT_COMPOSER_INSTALL' ) ) {
+		$composer_file = UA_ABSPATH . '/composer.json';
+		if ( file_exists( $composer_file ) ) {
+			$composer_content = file_get_contents( $composer_file ); //phpcs:ignore WordPress.WP.AlternativeFunctions.file_get_contents_file_get_contents
+			if ( false !== strpos( $composer_content, 'uncanny-automator' ) ) {
+				$automator_indicators++;
+			}
+		}
+	}
+
+	// Require at least 3 indicators to be confident this is Automator's test environment
+	// This significantly reduces the chance of false positives with other plugins
+	return 3 <= $automator_indicators;
+}
+
+/**
+ * Returns the Automator tables.
+ *
+ * @return array
+ */
+function get_automator_tables() {
+	return DB_Tables::get_automator_tables();
+}
+
+/**
+ * Get the required capability for core Automator operations.
+ *
+ * This capability is used for general operations like viewing/editing recipes,
+ * accessing admin pages, viewing logs, and basic recipe management.
+ *
+ * Example usage:
+ * - Admin menu access
+ * - Recipe post type capabilities
+ * - Viewing logs
+ * - Basic REST endpoints
+ * - Recipe builder operations
+ *
+ * @since 6.9
+ * @return string The capability required. Defaults to 'manage_options'.
+ */
+function automator_get_capability() {
+	return apply_filters( 'automator_capability', 'manage_options' );
+}
+
+/**
+ * Get the required capability for sensitive administrative operations.
+ *
+ * This capability is used for sensitive operations that require higher privileges,
+ * such as plugin settings, integration credentials, import/export, and system tools.
+ *
+ * Example usage:
+ * - Plugin settings and configuration
+ * - Integration OAuth/API credentials
+ * - Import/Export recipes
+ * - Debug tools and system information
+ * - License management
+ * - Database cleanup operations
+ *
+ * @since 6.9
+ * @return string The capability required. Defaults to 'manage_options'.
+ */
+function automator_get_admin_capability() {
+	return apply_filters( 'automator_admin_capability', 'manage_options' );
+}
+
+/**
+ * Query posts and return value/text options array.
+ *
+ * Replacement for Automator()->helpers->recipe->options->wp_query().
+ *
+ * @param array $params {
+ *     Optional. Query parameters.
+ *
+ *     @type string       $post_type      Post type. Default 'page'.
+ *     @type string|array $post_status    Post status. Default 'publish'.
+ *     @type int          $posts_per_page Number of posts. Default 999.
+ *     @type string       $orderby        Order by field. Default 'title'.
+ *     @type string       $order          Sort order. Default 'ASC'.
+ *     @type int|null     $post_parent    Parent post ID. Default null.
+ *     @type array        $meta_query     Meta query array. Default empty.
+ *     @type bool         $include_any    Prepend "Any" sentinel. Default false.
+ *     @type string|null  $any_label      Custom "Any" label. Default null.
+ *     @type bool         $include_all    Prepend "All" sentinel. Default false.
+ *     @type string|null  $all_label      Custom "All" label. Default null.
+ * }
+ * @param string $format 'modern' returns [ 'value' => string, 'text' => string ] arrays.
+ *                       'legacy' returns id => title associative array.
+ *
+ * @return array
+ *
+ * @since 7.2
+ */
+// phpcs:ignore Uncanny_Automator.Commenting.FunctionCommentAutoFix.MissingFunctionComment -- docblock exists but exceeds sniff's 100-token lookback.
+function automator_wp_query( array $params = array(), string $format = 'modern' ) {
+	static $instance = null;
+
+	if ( null === $instance ) {
+		$instance = new \Uncanny_Automator\Automator_WP_Query();
+	}
+
+	return $instance->post_options( $params, $format );
+}
