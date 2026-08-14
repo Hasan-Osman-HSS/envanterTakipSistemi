@@ -2,7 +2,6 @@
 /app/.envrc
 
 # System & Log Files
-*.log
 .DS_Store
 Thumbs.db
 Desktop.ini
